@@ -7,7 +7,19 @@ const fs = require('fs');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 let client = undefined;
-let isAddTaskMode = false;
+
+const MODE = {
+    DEFAULT: 'DEFAULT',
+    SET_GROUP: 'SET_GROUP',
+    ADD_TASK: 'ADD_TASK',
+};
+let mode = MODE.DEFAULT;
+let groupName = null;
+
+const setDefaultState = () => {
+    mode = MODE.DEFAULT;
+    groupName = null;
+}
 
 bot.start((ctx) => {
     client
@@ -21,22 +33,37 @@ bot.start((ctx) => {
 });
 
 bot.help((ctx) => ctx.reply(`Вот что я умею:\n
-    /add <текст задачи> - добавить новую задачу. Например: "/add Сходить за хлебом"
-    /show - показать список запланированных задач
+    /add <текст задачи> - добавить новую задачу в группу по умолчанию. Например: "/add Сходить за хлебом"
+    /add_grouped - добавить новую задачу, указав в последующем диалоге группу и текст задачи
+    /show - показать список запланированных задач из группы по умолчанию
+    /show <имя группы> - показать список запланированных задач из заданной группы. Например, "/show Работа"
     /show_done - показать список выполненных задач
     /clear - очистить список запланированных задач
     /clear_done - очистить список выполненных задач
     `))
 
-bot.command('show', (ctx) => {
-    isAddTaskMode = false;
+const separateArgument = (commandLine) => {
+    const index = commandLine.indexOf(' ');
+    if (index === -1) {
+        return '';
+    }
+    return commandLine.substring(index + 1);
+}
 
-    const text = 'SELECT * from TODO where Done=FALSE and account_name=$1;'
-    const values = [ctx.message.from.username];
+bot.command('show', (ctx) => {
+    setDefaultState();
+    const groupNameToShow = separateArgument(ctx.message.text);
+
+    const text = groupNameToShow === ''
+        ? 'SELECT * from TODO where Done=FALSE and account_name=$1 and groupName is NULL;'
+        : 'SELECT * from TODO where Done=FALSE and account_name=$1 and groupName=$2;';
+    const values = groupNameToShow === ''
+        ? [ctx.message.from.username]
+        : [ctx.message.from.username, groupNameToShow];
     client.query(text, values)
         .then(res => {
             if (res.rows.length === 0) {
-                return ctx.reply('У вас пока нет задач. Добавьте задачу командой /add');
+                return ctx.reply('У вас пока нет задач. Добавьте задачу командой /add или /add_grouped');
             }
             const buttons = res.rows.map(({id, value}) => [Markup.button.callback(value, id)]);
             return ctx.reply('Список задач. Кликните по задаче, чтобы отметить ее выполненной\n', {
@@ -48,7 +75,7 @@ bot.command('show', (ctx) => {
 });
 
 bot.command('show_done', (ctx) => {
-    isAddTaskMode = false;
+    setDefaultState();
     let response = 'Список выполненных задач:\n';
     const text = 'SELECT * from TODO where Done=TRUE and account_name=$1;'
     const values = [ctx.message.from.username];
@@ -64,17 +91,9 @@ bot.command('show_done', (ctx) => {
         });
 });
 
-const separateTodoValue = (commandLine) => {
-    const index = commandLine.indexOf(' ');
-    if (index === -1) {
-        return '';
-    }
-    return commandLine.substring(index + 1);
-}
-
 bot.command('add', (ctx) => {
-    isAddTaskMode = false;
-    const todoValue = separateTodoValue(ctx.message.text);
+    setDefaultState();
+    const todoValue = separateArgument(ctx.message.text);
     if (todoValue) {
         const text = 'INSERT INTO todo (value, done, account_name) VALUES ($1, FALSE, $2);';
         const values = [todoValue, ctx.message.from.username];
@@ -84,12 +103,28 @@ bot.command('add', (ctx) => {
             });
     } else {
         ctx.reply('Введите текст задачи:');
-        isAddTaskMode = true;
+        mode = MODE.ADD_TASK;
+    }
+});
+
+bot.command('add_grouped', (ctx) => {
+    setDefaultState();
+    const todoValue = separateArgument(ctx.message.text);
+    if (todoValue) {
+        const text = 'INSERT INTO todo (value, done, account_name) VALUES ($1, FALSE, $2);';
+        const values = [todoValue, ctx.message.from.username];
+        client.query(text, values)
+            .then(res => {
+                ctx.reply(`Задача "${todoValue}" добавлена`);
+            });
+    } else {
+        ctx.reply('Введите группу задачи:');
+        mode = MODE.SET_GROUP;
     }
 });
 
 bot.command('clear', (ctx) => {
-    isAddTaskMode = false;
+    setDefaultState();
     const text = 'DELETE FROM todo WHERE done=FALSE AND account_name=$1';
     const values = [ctx.message.from.username];
     client.query(text, values)
@@ -99,7 +134,7 @@ bot.command('clear', (ctx) => {
 });
 
 bot.command('clear_done', (ctx) => {
-    isAddTaskMode = false;
+    setDefaultState();
     const text = 'DELETE FROM todo WHERE done=TRUE AND account_name=$1';
     const values = [ctx.message.from.username];
     client.query(text, values)
@@ -120,21 +155,28 @@ bot.action(/.+/, ctx => {
 });
 
 bot.on('text', (ctx) => {
-    if (!isAddTaskMode) {
+    if (mode === MODE.DEFAULT) {
         return;
     }
-
-    isAddTaskMode = false;
-    const messageText = ctx.message.text;
-    if (messageText) {
-        const text = 'INSERT INTO todo (value, done, account_name) VALUES ($1, FALSE, $2);';
-        const values = [messageText, ctx.message.from.username];
-        client.query(text, values)
-            .then(res => {
-                ctx.reply(`Задача "${messageText}" добавлена`);
-            });
-    } else {
-        ctx.reply('Нельзя завести пустую задачу. Пожалуйста, попробуйте снова.');
+    if (mode === MODE.SET_GROUP) {
+        mode = MODE.ADD_TASK;
+        groupName = ctx.message.text;
+        ctx.reply('Введите текст задачи:');
+        return;
+    }
+    if (mode === MODE.ADD_TASK) {
+        const messageText = ctx.message.text;
+        if (messageText) {
+            const text = 'INSERT INTO todo (value, groupName, done, account_name) VALUES ($1, $2, FALSE, $3);';
+            const values = [messageText, groupName, ctx.message.from.username];
+            client.query(text, values)
+                .then(res => {
+                    ctx.reply(`Задача "${messageText}" добавлена в группу "${groupName ? groupName : 'по умолчанию'}"`);
+                    setDefaultState();
+                });
+        } else {
+            ctx.reply('Нельзя завести пустую задачу. Пожалуйста, попробуйте снова.');
+        }
     }
 });
 
